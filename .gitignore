@@ -1,8 +1,5 @@
+secrets.toml
 .streamlit/secrets.toml
+.env
 __pycache__/
 *.pyc
-.venv/
-venv/
-faiss.index
-chunks.json
-.env
