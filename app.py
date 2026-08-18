@@ -13,7 +13,7 @@ CHUNK_SIZE = 1000
 OVERLAP = 200
 TOP_K = 3
 SIMILARITY_THRESHOLD = 0.5
-EMBED_MODEL = "gemini-embedding-001"
+EMBED_MODEL = "gemini-embedding-2"
 CHAT_MODEL = "gemini-3.6-flash"  # confirm this model name is available to your key
 
 st.set_page_config(page_title="Chat with PDF — Roxy", page_icon="🤖")
