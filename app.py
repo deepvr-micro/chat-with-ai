@@ -1,8 +1,12 @@
 import os
+import io
+import time
+import hashlib
 import numpy as np
 import faiss
 import streamlit as st
 from google import genai
+from google.genai import errors as genai_errors
 from pypdf import PdfReader
 
 # ==========================================
@@ -13,7 +17,7 @@ CHUNK_SIZE = 1000
 OVERLAP = 200
 TOP_K = 3
 SIMILARITY_THRESHOLD = 0.5
-EMBED_MODEL = "gemini-embedding-2"
+EMBED_MODEL = "gemini-embedding-001"
 CHAT_MODEL = "gemini-3.6-flash"  # confirm this model name is available to your key
 
 st.set_page_config(page_title="Chat with PDF — Roxy", page_icon="🤖")
@@ -73,25 +77,67 @@ def chunk_text(text: str):
 # EMBEDDING + FAISS INDEX
 # ==========================================
 
-def embed(texts):
+def embed_one_with_retry(text, max_retries=5):
+    """Embed a single chunk, retrying with backoff if the free-tier
+    rate limit (429 RESOURCE_EXHAUSTED) is hit."""
+    delay = 8
+    for attempt in range(max_retries):
+        try:
+            result = client.models.embed_content(model=EMBED_MODEL, contents=text)
+            return result.embeddings[0].values
+        except genai_errors.ClientError as e:
+            if "RESOURCE_EXHAUSTED" in str(e) and attempt < max_retries - 1:
+                time.sleep(delay)
+                delay *= 2
+                continue
+            raise
+    raise RuntimeError("Embedding failed after repeated rate-limit retries.")
+
+
+def embed(texts, progress=None):
     vectors = []
-    for t in texts:
-        result = client.models.embed_content(model=EMBED_MODEL, contents=t)
-        vectors.append(result.embeddings[0].values)
+    for i, t in enumerate(texts):
+        vectors.append(embed_one_with_retry(t))
+        # Stay comfortably under the free-tier ~100 requests/minute limit.
+        time.sleep(0.8)
+        if progress is not None:
+            progress(i + 1, len(texts))
     return np.array(vectors, dtype="float32")
 
 
-def build_index(chunks):
-    vectors = embed(chunks)
+def build_index(chunks, progress=None):
+    vectors = embed(chunks, progress=progress)
     faiss.normalize_L2(vectors)
     idx = faiss.IndexFlatIP(vectors.shape[1])
     idx.add(vectors)
     return idx
 
 
+@st.cache_resource(show_spinner=False)
+def process_pdf(file_hash: str, _file_bytes: bytes):
+    """Extract, chunk, and index a PDF once per unique file. Cached at the
+    app-process level, so it's shared across every user/device/session —
+    not just per-browser-session — avoiding repeated re-embedding (and
+    repeated quota usage) every time someone opens the app."""
+    reader = PdfReader(io.BytesIO(_file_bytes))
+    text = ""
+    for page in reader.pages:
+        text += page.extract_text() or ""
+    chunks = chunk_text(text)
+
+    progress_bar = st.progress(0.0, text="Embedding document chunks...")
+
+    def update_progress(done, total):
+        progress_bar.progress(done / total, text=f"Embedding chunk {done}/{total}...")
+
+    index = build_index(chunks, progress=update_progress)
+    progress_bar.empty()
+    return index, chunks
+
+
 def search(query, index, chunks, top_k=TOP_K):
-    result = client.models.embed_content(model=EMBED_MODEL, contents=query)
-    query_vector = np.array([result.embeddings[0].values], dtype="float32")
+    vector = embed_one_with_retry(query)
+    query_vector = np.array([vector], dtype="float32")
     faiss.normalize_L2(query_vector)
 
     scores, indices = index.search(query_vector, top_k)
@@ -152,15 +198,19 @@ with st.sidebar:
     st.header("📄 Document")
     uploaded = st.file_uploader("Upload a PDF", type="pdf")
 
-    if uploaded is not None and uploaded.name != st.session_state.pdf_name:
-        with st.spinner("Reading and indexing your PDF... this can take a moment."):
-            text = extract_text(uploaded)
-            chunks = chunk_text(text)
-            st.session_state.index = build_index(chunks)
+    if uploaded is not None:
+        file_bytes = uploaded.getvalue()
+        file_hash = hashlib.md5(file_bytes).hexdigest()
+
+        if file_hash != st.session_state.get("pdf_hash"):
+            with st.spinner("Reading and indexing your PDF... this can take a moment."):
+                index, chunks = process_pdf(file_hash, file_bytes)
+            st.session_state.index = index
             st.session_state.chunks = chunks
             st.session_state.pdf_name = uploaded.name
+            st.session_state.pdf_hash = file_hash
             st.session_state.history = []
-        st.success(f"Indexed {len(chunks)} chunks from {uploaded.name}")
+            st.success(f"Indexed {len(chunks)} chunks from {uploaded.name}")
 
     if st.session_state.pdf_name:
         st.info(f"Active document: **{st.session_state.pdf_name}**")
@@ -168,6 +218,7 @@ with st.sidebar:
             st.session_state.index = None
             st.session_state.chunks = []
             st.session_state.pdf_name = None
+            st.session_state.pdf_hash = None
             st.session_state.history = []
             st.rerun()
 
